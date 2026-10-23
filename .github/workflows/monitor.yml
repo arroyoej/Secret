@@ -1,0 +1,99 @@
+import Foundation
+import CryptoKit
+import UserNotifications
+
+@MainActor
+class LairMonitor: ObservableObject {
+    @Published var lastChecked: Date?
+    @Published var statusMessage: String = "Idle"
+    
+    private let targetURL = URL(string: "https://secretlair.wizards.com/us/en")!
+    private let storedHashKey = "secret_lair_previous_hash"
+    
+    // Replace with your email API credentials (e.g., Resend, SendGrid, Postmark)
+    private let emailApiKey = "YOUR_TRANSACTIONAL_EMAIL_API_KEY"
+    private let recipientEmail = "edgardo@mac.com"
+
+    func checkForChanges() async {
+        statusMessage = "Checking for updates..."
+        
+        do {
+            var request = URLRequest(url: targetURL)
+            // Use cache-busting / no-cache header to prevent receiving cached responses
+            request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+            request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                statusMessage = "Failed to fetch: Server error"
+                return
+            }
+
+            // Generate SHA-256 hash of the payload
+            let currentHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            let previousHash = UserDefaults.standard.string(forKey: storedHashKey)
+            
+            self.lastChecked = Date()
+
+            if let previousHash = previousHash {
+                if previousHash != currentHash {
+                    // Update stored hash
+                    UserDefaults.standard.set(currentHash, forKey: storedHashKey)
+                    statusMessage = "Change detected! Sending alert..."
+                    
+                    // Trigger alert & email
+                    await sendEmailAlert()
+                    sendLocalNotification()
+                } else {
+                    statusMessage = "No changes detected."
+                }
+            } else {
+                // Initial baseline save
+                UserDefaults.standard.set(currentHash, forKey: storedHashKey)
+                statusMessage = "Baseline established. Monitoring active."
+            }
+        } catch {
+            statusMessage = "Error: \(error.localizedDescription)"
+        }
+    }
+
+    private func sendEmailAlert() async {
+        // Example using Resend REST API (https://api.resend.com/emails)
+        guard let apiURL = URL(string: "https://api.resend.com/emails") else { return }
+
+        var request = URLRequest(url: apiURL)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(emailApiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let payload: [String: Any] = [
+            "from": "Alerts <alerts@resend.dev>",
+            "to": [recipientEmail],
+            "subject": "Secret Lair Website Update Detected!",
+            "html": "<p>Changes were detected on <a href='https://secretlair.wizards.com/us/en'>Secret Lair</a>.</p>"
+        ]
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let httpRes = response as? HTTPURLResponse, (200...299).contains(httpRes.statusCode) {
+                print("Email alert sent successfully.")
+            }
+        } catch {
+            print("Failed to dispatch email: \(error.localizedDescription)")
+        }
+    }
+
+    private func sendLocalNotification() {
+        let content = UNMutableNotificationContent()
+        content.title = "Secret Lair Updated!"
+        content.body = "A change was detected on the Secret Lair storefront."
+        content.sound = .default
+
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: trigger)
+        UNUserNotificationCenter.current().add(request)
+    }
+}
